@@ -66,10 +66,15 @@ class TLS(dpkt.Packet):
         # or throws NeedData if the buffer is incomplete (truncated).
         # tls_multi_factory() will do the same, but gracefully; it will unpack 
         # multiple TLS records and catch NeedData if the buffer was incomplete
+        # Parse into a local list first and commit the record boundary state
+        # only once the whole buffer parsed, so a truncated trailing record
+        # does not leave partially parsed records behind.
+        records = []
         while buf:
             tlsrec = TLSRecord(buf)
-            self.records.append(tlsrec)
+            records.append(tlsrec)
             buf = buf[5 + tlsrec.length:]  # 5 = TLSRecord.__hdr_len__
+        self.records = records
         self.data = b''
 
 
@@ -246,10 +251,12 @@ class TLSRecord(dpkt.Packet):
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
         header_length = self.__hdr_len__
-        self.data = buf[header_length:header_length + self.length]
-        # make sure buffer was long enough
-        if len(self.data) < self.length:
+        data = buf[header_length:header_length + self.length]
+        # make sure buffer was long enough; validate before committing any
+        # state so a truncated record does not expose half a message
+        if len(data) < self.length:
             raise dpkt.NeedData('TLSRecord data was too short.')
+        self.data = data
         # assume compressed and encrypted when it's been parsed from
         # raw data
         self.compressed = True
@@ -360,12 +367,21 @@ class TLSCertificate(dpkt.Packet):
         try:
             dpkt.Packet.unpack(self, buf)
             all_certs, all_certs_len = parse_variable_array(self.data, 3)
-            self.certificates = []
+            if len(all_certs) != all_certs_len - 3:
+                # declared certificate list was truncated
+                raise dpkt.NeedData
+            certificates = []
             pointer = 3
             while pointer < all_certs_len:
                 cert, parsed = parse_variable_array(self.data[pointer:], 3)
-                self.certificates.append((cert))
+                if len(cert) != parsed - 3:
+                    # declared certificate was truncated
+                    raise dpkt.NeedData
+                certificates.append(cert)
                 pointer += parsed
+            # commit only after the whole list parsed, so a truncated
+            # message does not leave a partial certificate list behind
+            self.certificates = certificates
         except struct.error:
             raise dpkt.NeedData
 
@@ -423,18 +439,30 @@ class TLSHandshake(dpkt.Packet):
     }
 
     def unpack(self, buf):
-        dpkt.Packet.unpack(self, buf)
+        # Validate the whole message before committing any state, so a
+        # truncated message (e.g. a handshake fragmented across several
+        # TLSRecords) raises NeedData without exposing half a message or
+        # leaving stale state behind.
+        if len(buf) < self.__hdr_len__:
+            raise dpkt.NeedData('TLSHandshake header was too short.')
+        type_ = compat_ord(buf[0])
+        length_bytes = buf[1:4]
         # Wait, might there be more than one message of self.type?
-        embedded_type = HANDSHAKE_TYPES.get(self.type, None)
+        embedded_type = HANDSHAKE_TYPES.get(type_, None)
         if embedded_type is None:
             raise SSL3Exception('Unknown or invalid handshake type %d' %
-                                self.type)
+                                type_)
+        length = struct.unpack('!I', b'\x00' + length_bytes)[0]
         # only take the right number of bytes
-        self.data = self.data[:self.length]
-        if len(self.data) != self.length:
+        data = buf[self.__hdr_len__:self.__hdr_len__ + length]
+        if len(data) != length:
             raise dpkt.NeedData
         # get class out of embedded_type tuple
-        self.data = embedded_type[1](self.data)
+        parsed = embedded_type[1](data)
+        # everything parsed; commit the new state
+        self.type = type_
+        self.length_bytes = length_bytes
+        self.data = parsed
 
     @property
     def length(self):
@@ -1056,3 +1084,136 @@ def test_extensions():
     hello = handshake.data
     assert len(hello.extensions) == 8
     assert hello.extensions[-1] == (65281, b'\x00')
+
+
+class TestRecordBoundaryState(object):
+    """A truncated record, or a handshake fragmented across several records,
+    must not expose half a message: record boundary state and handshake
+    state are validated first and committed separately, so a failure does
+    not leave stale state behind. Legal handshake records must still parse.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        # two complete records followed by a truncated third record
+        # (declares 16 bytes of payload, only 4 are present)
+        cls.buf_two_records = _hexdecode(
+            b'1703010008' + b'41' * 8 +
+            b'1703010008' + b'42' * 8
+        )
+        cls.buf_truncated_record = cls.buf_two_records + _hexdecode(
+            b'1703010010' + b'43' * 4
+        )
+
+    def test_truncated_record_raises_need_data(self):
+        import pytest
+        pytest.raises(dpkt.NeedData, TLS, self.buf_truncated_record)
+
+    def test_failed_unpack_leaves_no_record_state(self):
+        import pytest
+        t = TLS(self.buf_two_records)
+        assert (len(t.records) == 2)
+        records_before = t.records
+        with pytest.raises(dpkt.NeedData):
+            t.unpack(self.buf_truncated_record)
+        # the partially parsed records were not committed
+        assert (t.records is records_before)
+        assert (len(t.records) == 2)
+
+    def test_complete_records_still_parse(self):
+        t = TLS(self.buf_two_records)
+        assert (len(t.records) == 2)
+        assert (t.records[0].data == b'\x41' * 8)
+        assert (t.records[1].data == b'\x42' * 8)
+
+    def test_fragmented_handshake_raises_need_data(self):
+        import pytest
+        # a ClientHello fragmented across records: the handshake header
+        # declares 63 bytes but this record only carries a fragment
+        fragment = _hexdecode(
+            b'0100003f'      # handshake header: ClientHello, length 63
+            b'0303'          # version
+            + b'00' * 16     # only half of the random is present
+        )
+        pytest.raises(dpkt.NeedData, TLSHandshake, fragment)
+
+    def test_failed_handshake_unpack_leaves_no_state(self):
+        import pytest
+        h = TLSHandshake(b'\x00\x00\x00\x01\xff')
+        assert (isinstance(h.data, TLSHelloRequest))
+        # a fragmented ClientHello must not clobber the parsed message
+        fragment = _hexdecode(b'0100003f' b'0303' + b'00' * 16)
+        with pytest.raises(dpkt.NeedData):
+            h.unpack(fragment)
+        assert (isinstance(h.data, TLSHelloRequest))
+
+    def test_valid_multirecord_handshakes_still_parse(self):
+        # HelloRequest and ServerHelloDone, one record each
+        buf = (b'\x16\x03\x03\x00\x04\x00\x00\x00\x00'
+               b'\x16\x03\x03\x00\x04\x0e\x00\x00\x00')
+        t = TLS(buf)
+        assert (len(t.records) == 2)
+        assert (isinstance(TLSHandshake(t.records[0].data).data, TLSHelloRequest))
+        assert (isinstance(TLSHandshake(t.records[1].data).data, TLSServerHelloDone))
+
+    def test_valid_clienthello_sni_still_parses(self):
+        # ClientHello with a server_name (SNI) extension for example.com
+        buf = _hexdecode(
+            b'0100003f'          # handshake header: ClientHello, length 63
+            b'0303'              # version
+            + b'00' * 32 +       # random
+            b'00'                # session_id length
+            b'0002' b'002f'      # cipher suites
+            b'01' b'00'          # compression methods
+            b'0014'              # extensions length
+            b'0000'              # extension type: server_name
+            b'0010'              # extension length
+            b'000e'              # server_name list length
+            b'00'                # name type: host_name
+            b'000b'              # name length
+            b'6578616d706c652e636f6d'  # example.com
+        )
+        hello = TLSHandshake(buf).data
+        assert (isinstance(hello, TLSClientHello))
+        assert (hello.extensions[0][0] == 0)
+        assert (hello.extensions[0][1].endswith(b'example.com'))
+
+
+class TestTLSCertificateState(object):
+    """A truncated certificate message must raise NeedData and must not
+    leave a partial certificate list behind."""
+
+    @classmethod
+    def setup_class(cls):
+        # one valid 4-byte certificate
+        cls.valid = _hexdecode(
+            b'000007'          # certificates length
+            b'000004'          # certificate length
+            b'deadbeef'        # certificate
+        )
+
+    def test_valid_certificate_still_parses(self):
+        c = TLSCertificate(self.valid)
+        assert (c.certificates == [_hexdecode(b'deadbeef')])
+
+    def test_truncated_cert_list_raises_need_data(self):
+        import pytest
+        # declares a 10-byte certificate list, only 4 bytes are present
+        pytest.raises(dpkt.NeedData, TLSCertificate,
+                      _hexdecode(b'00000a' b'000004' b'dead'))
+
+    def test_truncated_cert_raises_need_data(self):
+        import pytest
+        # the certificate list is complete, but the certificate inside
+        # declares more bytes than are present
+        pytest.raises(dpkt.NeedData, TLSCertificate,
+                      _hexdecode(b'000007' b'000005' b'deadbeef'))
+
+    def test_failed_unpack_leaves_no_state(self):
+        import pytest
+        c = TLSCertificate(self.valid)
+        certificates_before = c.certificates
+        with pytest.raises(dpkt.NeedData):
+            c.unpack(_hexdecode(b'00000a' b'000004' b'dead'))
+        assert (c.certificates is certificates_before)
+        assert (len(c.certificates) == 1)
