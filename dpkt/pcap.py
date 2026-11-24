@@ -303,6 +303,24 @@ class Writer(object):
         self.__f.close()
 
 
+_MAX_READ_SIZE = 65536
+
+
+def _read_exact(fileobj, size):
+    """Read exactly ``size`` bytes, tolerating short reads from the stream."""
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = fileobj.read(min(remaining, _MAX_READ_SIZE))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if len(chunks) == 1:
+        return chunks[0]
+    return b''.join(chunks)
+
+
 class Reader(object):
     """Simple pypcap-compatible pcap file reader.
 
@@ -315,7 +333,10 @@ class Reader(object):
     def __init__(self, fileobj):
         self.name = getattr(fileobj, 'name', '<%s>' % fileobj.__class__.__name__)
         self.__f = fileobj
-        buf = self.__f.read(FileHdr.__hdr_len__)
+        buf = _read_exact(self.__f, FileHdr.__hdr_len__)
+        if len(buf) < FileHdr.__hdr_len__:
+            raise dpkt.NeedData('truncated pcap file header: expected %d bytes, got %d' %
+                                (FileHdr.__hdr_len__, len(buf)))
         self.__fh = FileHdr(buf)
 
         # save magic
@@ -337,11 +358,18 @@ class Reader(object):
         self._divisor = Decimal('1E9') if magic in (TCPDUMP_MAGIC_NANO, PMUDPCT_MAGIC_NANO) else 1E6
         self.snaplen = self.__fh.snaplen
         self.filter = ''
+        self.__failed = False
+        self.__failure = None
         self.__iter = iter(self)
 
     @property
     def fd(self):
         return self.__f.fileno()
+
+    @property
+    def failure(self):
+        """Description of the malformed record that made this reader terminal."""
+        return self.__failure
 
     def fileno(self):
         return self.fd
@@ -389,13 +417,58 @@ class Reader(object):
     def loop(self, callback, *args):
         self.dispatch(0, callback, *args)
 
+    def _fail(self, message):
+        """Make the reader terminal after a malformed record.
+
+        A pcap file has no resynchronisation markers, so once a record header
+        or its payload cannot be trusted there is no safe place to resume
+        from.  Remember the failure and move the underlying stream to its end
+        (when possible) so that later iteration, as well as a new Reader on
+        the same file object, consistently observes EOF instead of treating
+        record payload bytes as another header.
+        """
+        self.__failed = True
+        self.__failure = message
+        try:
+            self.__f.seek(0, 2)
+        except (AttributeError, IOError, OSError, ValueError):
+            # The failed flag still makes this reader terminal for
+            # non-seekable file-like objects.
+            pass
+
     def __iter__(self):
+        if self.__failed:
+            return
         while 1:
-            buf = self.__f.read(self.__ph.__hdr_len__)
+            buf = _read_exact(self.__f, self.__ph.__hdr_len__)
             if not buf:
                 break
+            if len(buf) < self.__ph.__hdr_len__:
+                message = 'truncated pcap packet header: expected %d bytes, got %d' % (
+                    self.__ph.__hdr_len__, len(buf))
+                self._fail(message)
+                raise ValueError(message)
             hdr = self.__ph(buf)
-            buf = self.__f.read(hdr.caplen)
+
+            # A record cannot contain more captured bytes than the file's
+            # snaplen, nor more than the packet's original length.  Reject
+            # before consuming bytes so a forged caplen cannot swallow the
+            # following record.
+            if hdr.caplen > self.snaplen:
+                message = 'invalid pcap packet: caplen (%d) exceeds snaplen (%d)' % (hdr.caplen, self.snaplen)
+                self._fail(message)
+                raise ValueError(message)
+            if hdr.caplen > hdr.len:
+                message = 'invalid pcap packet: caplen (%d) exceeds len (%d)' % (hdr.caplen, hdr.len)
+                self._fail(message)
+                raise ValueError(message)
+
+            buf = _read_exact(self.__f, hdr.caplen)
+            if len(buf) < hdr.caplen:
+                message = 'truncated pcap packet data: expected %d bytes, got %d' % (
+                    hdr.caplen, len(buf))
+                self._fail(message)
+                raise ValueError(message)
             yield (hdr.tv_sec + (hdr.tv_usec / self._divisor), buf)
 
 
@@ -459,9 +532,9 @@ def test_pcap_endian():
 
 
 class TestData():
-    pcap = (  # full libpcap file with one packet
+    pcap = (  # libpcap file with one truncated packet (caplen < len)
         b'\xd4\xc3\xb2\xa1\x02\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x01\x00\x00\x00'
-        b'\xb2\x67\x4a\x42\xae\x91\x07\x00\x46\x00\x00\x00\x46\x00\x00\x00\x00\xc0\x9f\x32\x41\x8c\x00\xe0'
+        b'\xb2\x67\x4a\x42\xae\x91\x07\x00\x2a\x00\x00\x00\x46\x00\x00\x00\x00\xc0\x9f\x32\x41\x8c\x00\xe0'
         b'\x18\xb1\x0c\xad\x08\x00\x45\x00\x00\x38\x00\x00\x40\x00\x40\x11\x65\x47\xc0\xa8\xaa\x08\xc0\xa8'
         b'\xaa\x14\x80\x1b\x00\x35\x00\x24\x85\xed'
     )
@@ -552,6 +625,54 @@ def test_reader_dloff():
     assert reader.dloff == 0
 
     assert next(reader) == (3.000005, b'\x11' * 4)
+
+
+def test_reader_rejects_truncated_packet():
+    import pytest
+    from .compat import BytesIO
+
+    # caplen says 42 bytes, but the last byte of the record is missing.
+    data = TestData().pcap[:-1]
+    reader = Reader(BytesIO(data))
+    with pytest.raises(ValueError):
+        next(reader)
+
+    # A failed reader is terminal: it must not emit the partial record later.
+    assert list(reader) == []
+
+
+def test_reader_rejects_caplen_beyond_snaplen():
+    import struct
+    import pytest
+    from .compat import BytesIO
+
+    filehdr = struct.pack('<IHHIIII', TCPDUMP_MAGIC, PCAP_VERSION_MAJOR,
+                          PCAP_VERSION_MINOR, 0, 0, 8, DLT_EN10MB)
+    pkthdr = struct.pack('<IIII', 0, 0, 9, 9)
+    reader = Reader(BytesIO(filehdr + pkthdr + b'\x00' * 9))
+    with pytest.raises(ValueError):
+        next(reader)
+
+
+def test_reader_rejects_partial_packet_header():
+    import pytest
+    from .compat import BytesIO
+
+    data = TestData().pcap[:FileHdr.__hdr_len__ + PktHdr.__hdr_len__ - 1]
+    with pytest.raises(ValueError):
+        list(Reader(BytesIO(data)))
+
+
+def test_reader_empty_and_multiple_packets():
+    import struct
+    from .compat import BytesIO
+
+    filehdr = struct.pack('<IHHIIII', TCPDUMP_MAGIC, PCAP_VERSION_MAJOR,
+                          PCAP_VERSION_MINOR, 0, 0, 64, DLT_EN10MB)
+    data = filehdr + struct.pack('<IIII', 1, 0, 0, 0)
+    data += struct.pack('<IIII', 2, 1, 4, 4) + b'ping'
+
+    assert list(Reader(BytesIO(data))) == [(1.0, b''), (2.000001, b'ping')]
 
 
 @TryExceptException(ValueError, msg="invalid tcpdump header")
