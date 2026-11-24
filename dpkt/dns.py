@@ -88,28 +88,44 @@ def pack_name(name, off, label_ptrs):
     return buf
 
 
-def unpack_name(buf, off):
+def _unpack_name(buf, off, end):
+    """Unpack a DNS name from buf[off:end].
+
+    ``end`` bounds the part of the buffer in which the name is physically
+    encoded.  Once a compression pointer is followed the target may live
+    anywhere earlier in the message, so the bound becomes the full buffer.
+    """
+    buf_len = len(buf)
     name = []
     saved_off = 0
     start_off = off
     name_length = 0
     while True:
-        if off >= len(buf):
+        if off < 0 or off >= buf_len or off >= end:
             raise dpkt.NeedData()
         n = compat_ord(buf[off])
         if n == 0:
             off += 1
             break
         elif (n & 0xc0) == 0xc0:
+            # A pointer is two bytes long; make sure both are present.
+            if off + 2 > buf_len or off + 2 > end:
+                raise dpkt.NeedData()
             ptr = struct.unpack('>H', buf[off:off + 2])[0] & 0x3fff
-            if ptr >= start_off:
+            # Compression pointers must refer to a prior occurrence of a
+            # name.  Requiring each pointer to move strictly backwards also
+            # makes self-referential and circular chains impossible.
+            if ptr >= start_off or ptr >= buf_len:
                 raise dpkt.UnpackError('Invalid label compression pointer')
             off += 2
             if not saved_off:
                 saved_off = off
             start_off = off = ptr
+            end = buf_len
         elif (n & 0xc0) == 0x00:
             off += 1
+            if off + n > buf_len or off + n > end:
+                raise dpkt.NeedData()
             name.append(buf[off:off + n])
             name_length += n + 1
             if name_length > 255:
@@ -119,7 +135,16 @@ def unpack_name(buf, off):
             raise dpkt.UnpackError('Invalid label length %02x' % n)
     if not saved_off:
         saved_off = off
-    return codecs.decode(b'.'.join(name), 'utf-8'), saved_off
+    try:
+        name = codecs.decode(b'.'.join(name), 'utf-8')
+    except UnicodeDecodeError:
+        raise dpkt.UnpackError('Invalid name encoding')
+    return name, saved_off
+
+
+def unpack_name(buf, off):
+    """Unpack a DNS name from buf at off, staying within the message."""
+    return _unpack_name(buf, off, len(buf))
 
 
 class DNS(dpkt.Packet):
@@ -304,27 +329,36 @@ class DNS(dpkt.Packet):
                 raise dpkt.PackError('RR type %s is not supported' % self.type)
 
         def unpack_rdata(self, buf, off):
+            # Bound the name to the RDATA that is actually present.  In the
+            # normal unpack path this is the exact RDLENGTH slice.
+            end = off + len(self.rdata)
             if self.type == DNS_A:
                 self.ip = self.rdata
             elif self.type == DNS_NS:
-                self.nsname, off = unpack_name(buf, off)
+                self.nsname, off = _unpack_name(buf, off, end)
             elif self.type == DNS_CNAME:
-                self.cname, off = unpack_name(buf, off)
+                self.cname, off = _unpack_name(buf, off, end)
             elif self.type == DNS_PTR:
-                self.ptrname, off = unpack_name(buf, off)
+                self.ptrname, off = _unpack_name(buf, off, end)
             elif self.type == DNS_SOA:
-                self.mname, off = unpack_name(buf, off)
-                self.rname, off = unpack_name(buf, off)
+                self.mname, off = _unpack_name(buf, off, end)
+                self.rname, off = _unpack_name(buf, off, end)
+                if off + 20 > end:
+                    raise dpkt.NeedData()
                 self.serial, self.refresh, self.retry, self.expire, self.minimum = \
                     struct.unpack('>IIIII', buf[off:off + 20])
             elif self.type == DNS_MX:
+                if off + 2 > end:
+                    raise dpkt.NeedData()
                 self.preference = struct.unpack('>H', self.rdata[:2])
-                self.mxname, off = unpack_name(buf, off + 2)
+                self.mxname, off = _unpack_name(buf, off + 2, end)
             elif self.type == DNS_TXT or self.type == DNS_HINFO:
                 self.text = []
                 buf = self.rdata
                 while buf:
                     n = compat_ord(buf[0])
+                    if 1 + n > len(buf):
+                        raise dpkt.NeedData()
                     self.text.append(codecs.decode(buf[1:1 + n], 'utf-8'))
                     buf = buf[1 + n:]
             elif self.type == DNS_AAAA:
@@ -332,8 +366,10 @@ class DNS(dpkt.Packet):
             elif self.type == DNS_NULL:
                 self.null = codecs.encode(self.rdata, 'hex')
             elif self.type == DNS_SRV:
+                if off + 6 > end:
+                    raise dpkt.NeedData()
                 self.priority, self.weight, self.port = struct.unpack('>HHH', self.rdata[:6])
-                self.srvname, off = unpack_name(buf, off + 6)
+                self.srvname, off = _unpack_name(buf, off + 6, end)
             elif self.type == DNS_OPT:
                 pass  # RFC-6891: OPT is a pseudo-RR not carrying any DNS data
             else:
@@ -347,6 +383,8 @@ class DNS(dpkt.Packet):
         """Return DNS question and new offset."""
         q = self.Q()
         q.name, off = unpack_name(buf, off)
+        if off + 4 > len(buf):
+            raise dpkt.NeedData()
         q.type, q.cls = struct.unpack('>HH', buf[off:off + 4])
         off += 4
         return q, off
@@ -361,8 +399,12 @@ class DNS(dpkt.Packet):
         """Return DNS RR and new offset."""
         rr = self.RR()
         rr.name, off = unpack_name(buf, off)
+        if off + 10 > len(buf):
+            raise dpkt.NeedData()
         rr.type, rr.cls, rr.ttl, rdlen = struct.unpack('>HHIH', buf[off:off + 10])
         off += 10
+        if off + rdlen > len(buf):
+            raise dpkt.NeedData()
         rr.rdata = buf[off:off + rdlen]
         rr.rlen = rdlen
         rr.unpack_rdata(buf, off)
@@ -370,19 +412,29 @@ class DNS(dpkt.Packet):
         return rr, off
 
     def unpack(self, buf):
-        dpkt.Packet.unpack(self, buf)
+        # Parse everything into local variables first.  A malformed record
+        # must not leave the packet with a partially populated response.
+        if len(buf) < self.__hdr_len__:
+            raise dpkt.NeedData()
+        id_, op_, qd_cnt, an_cnt, ns_cnt, ar_cnt = struct.unpack(
+            self.__hdr_fmt__, buf[:self.__hdr_len__])
         off = self.__hdr_len__
-        cnt = self.qd  # FIXME: This relies on this being properly set somewhere else
-        self.qd = []
-        for _ in range(cnt):
+
+        qd = []
+        for _ in range(qd_cnt):
             q, off = self.unpack_q(buf, off)
-            self.qd.append(q)
-        for x in ('an', 'ns', 'ar'):
-            cnt = getattr(self, x, 0)
-            setattr(self, x, [])
+            qd.append(q)
+
+        sections = []
+        for cnt in (an_cnt, ns_cnt, ar_cnt):
+            records = []
             for _ in range(cnt):
                 rr, off = self.unpack_rr(buf, off)
-                getattr(self, x).append(rr)
+                records.append(rr)
+            sections.append(records)
+
+        self.id, self.op = id_, op_
+        self.qd, self.an, self.ns, self.ar = [qd] + sections
         self.data = b''
 
     def __len__(self):
@@ -599,6 +651,49 @@ def test_pack_name():
 def test_unpack_name():
     """If the offset is longer than the buffer, there will be an UnpackError"""
     unpack_name(b' ', 0)
+
+
+@TryExceptException(dpkt.UnpackError)
+def test_unpack_name_truncated_pointer():
+    """A compression pointer must fit entirely in the buffer."""
+    unpack_name(b'\x03www\x03com\xc0', 0)
+
+
+@TryExceptException(dpkt.UnpackError)
+def test_unpack_name_self_pointer():
+    """A name cannot point at itself."""
+    unpack_name(b'\x00' * 12 + b'\xc0\x0c', 12)
+
+
+@TryExceptException(dpkt.UnpackError)
+def test_unpack_name_label_overruns_buffer():
+    """A label must fit entirely in the buffer."""
+    unpack_name(b'\x05abc', 0)
+
+
+def test_unpack_name_compression():
+    """Names can still be read through valid compression pointers."""
+    buf = b'\x03www\x03com\x00\x03ftp\xc0\x00'
+    assert unpack_name(buf, 9) == ('ftp.www.com', 15)
+
+
+def test_malformed_response_is_atomic():
+    """A malformed record must not leave a partially populated response."""
+    dns = DNS(define_testdata().a_resp)
+    qd, an, ns, ar, data = dns.qd, dns.an, dns.ns, dns.ar, dns.data
+
+    try:
+        dns.unpack(define_testdata().a_resp[:-4])
+    except dpkt.UnpackError:
+        pass
+    else:
+        raise AssertionError('There should have been an Exception raised')
+
+    assert dns.qd is qd
+    assert dns.an is an
+    assert dns.ns is ns
+    assert dns.ar is ar
+    assert dns.data is data
 
 
 @TryExceptException(dpkt.UnpackError)
