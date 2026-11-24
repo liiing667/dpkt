@@ -48,14 +48,17 @@ class SCTP(dpkt.Packet):
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
         l_ = []
-        while self.data:
-            chunk = Chunk(self.data)
+        # Only chunks whose full declared extent (header + data + optional
+        # padding) is present in the buffer are published.  A malformed or
+        # truncated chunk raises instead of rewinding to the previous chunk
+        # boundary, so callers never observe a partial chunk set.
+        rest = self.data
+        while rest:
+            chunk = Chunk(rest)
             l_.append(chunk)
-            if len(chunk) == 0:
-                self.data = b''
-                break
-            self.data = self.data[len(chunk):]
+            rest = rest[len(chunk):]
         self.chunks = l_
+        self.data = b''
 
     def __len__(self):
         return self.__hdr_len__ + sum(len(x) for x in self.chunks)
@@ -77,18 +80,37 @@ class Chunk(dpkt.Packet):
         ('len', 'H', 0)
     )
 
+    def __init__(self, *args, **kwargs):
+        self.padding = b''  # optional 4-byte alignment padding for DATA chunks
+        super(Chunk, self).__init__(*args, **kwargs)
+
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
 
-        self.data = self.data[:self.len - self.__hdr_len__]
-        self.padding = b''  # optional padding for DATA chunks
+        # The chunk length covers the 4-byte chunk header and the chunk data.
+        # A zero (or sub-header) length is invalid and must not be treated as
+        # the end of the chunk list.
+        if self.len < self.__hdr_len__:
+            raise dpkt.UnpackError('invalid SCTP chunk length: %d' % self.len)
 
-        # SCTP DATA Chunked is padded, 4-bytes aligned
+        # The whole chunk, including its data, has to be present in the buffer.
+        # Otherwise the packet is truncated and must not be published.
+        if len(buf) < self.len:
+            raise dpkt.NeedData('%d bytes left, %d needed for SCTP chunk'
+                                % (len(buf), self.len))
+
+        self.data = buf[self.__hdr_len__:self.len]
+
+        # SCTP DATA chunks are padded to a 4-byte boundary.  The padding bytes
+        # are part of the wire format and have to be present and consistent,
+        # otherwise the next chunk boundary cannot be located reliably.
         if self.type == DATA and self.len % 4:
-            plen = 4 - self.len % 4  # padded length
-            if plen:
-                pos = self.__hdr_len__ + len(self.data)  # end of data in buf
-                self.padding = buf[pos:pos + plen]
+            plen = 4 - (self.len % 4)  # padding length
+            pad_end = self.len + plen
+            if len(buf) < pad_end:
+                raise dpkt.NeedData('%d bytes left, %d needed for padded SCTP chunk'
+                                    % (len(buf), pad_end))
+            self.padding = buf[self.len:pad_end]
 
     def __len__(self):
         return self.len + len(self.padding)
@@ -160,25 +182,71 @@ def test_sctp_data_chunk():  # https://github.com/kbandla/dpkt/issues/499
 
     # test packing of the padded chunk
     assert bytes(ch) == d[SCTP.__hdr_len__:]
-  
 
 
-def test_malformed_sctp_data_chunk():  
+def test_malformed_sctp_data_chunk():
+    import pytest
+
     # packet 7964 from '4.pcap' downloaded from https://research.unsw.edu.au/projects/unsw-nb15-dataset
     d = (b'\x27\x0f\xe1\xc3\xc2\x73\x4d\x32\x4f\x54\x27\x8c' #header
          b'\x0b\x00\x00\x04' #chunk 0, COOKIE_ACK chunk
          b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00') #chunk 1, malformed DATA chunk, size labeled as 0
 
+    # the zero-length chunk must not be published as a (duplicated) chunk and
+    # parsing must not fall back to the previous chunk boundary
+    with pytest.raises(dpkt.UnpackError):
+        SCTP(d)
+
+
+def test_sctp_truncated_last_chunk():
+    import pytest
+
+    # a complete COOKIE_ACK chunk followed by a DATA chunk whose declared
+    # length runs past the end of the buffer
+    d = (b'\x27\x0f\xe1\xc3\xc2\x73\x4d\x32\x4f\x54\x27\x8c'  # SCTP header
+         b'\x0b\x00\x00\x04'                                  # COOKIE_ACK chunk
+         b'\x00\x00\x00\x0c\x01\x02')                        # DATA chunk, len 12 but truncated
+
+    # the truncated packet must not be published, even though a complete chunk
+    # precedes the bad one
+    with pytest.raises(dpkt.NeedData):
+        SCTP(d)
+
+
+def test_sctp_data_chunk_missing_padding():
+    import pytest
+
+    # DATA chunk of len 5 (needs 3 padding bytes to reach the 4-byte boundary)
+    # but the buffer ends right after the chunk data
+    d = (b'\x27\x0f\xe1\xc3\xc2\x73\x4d\x32\x4f\x54\x27\x8c'  # SCTP header
+         b'\x00\x00\x00\x05\x01')                             # DATA chunk, no padding
+
+    with pytest.raises(dpkt.NeedData):
+        SCTP(d)
+
+
+def test_sctp_duplicate_and_multi_chunks():
+    # two identical SACK chunks (duplicate chunk identity) followed by a
+    # HEARTBEAT chunk; every complete chunk has to be preserved and parsing
+    # must continue after the duplicated identity
+    sack = Chunk(type=SACK, len=16, data=b'\x00' * 12)       # 4-byte hdr + 12-byte data
+    hb = Chunk(type=HEARTBEAT, len=4)
+    d = (b'\x27\x0f\xe1\xc3\xc2\x73\x4d\x32\x4f\x54\x27\x8c'  # SCTP header
+         + bytes(sack) + bytes(sack) + bytes(hb))             # duplicate SACK + HEARTBEAT
 
     sctp = SCTP(d)
-    assert sctp.chunks
-    assert len(sctp.chunks) == 2
-
-    ch = sctp.chunks[1]
-    assert ch.type == DATA
-    assert ch.len == 0
-    assert len(ch) == 0 
-    assert ch.data == b'\x00\x00'
-    
-    # no remaining sctp data
     assert sctp.data == b''
+    assert len(sctp.chunks) == 3
+
+    # duplicate chunk identities are both observable, not deduplicated
+    assert [ch.type for ch in sctp.chunks] == [SACK, SACK, HEARTBEAT]
+    assert sctp.chunks[0].len == sctp.chunks[1].len == 16
+    assert bytes(sctp.chunks[0]) == bytes(sctp.chunks[1])
+
+    # the legal multi-chunk packet round-trips (the checksum field is
+    # recomputed when packing, so compare header and chunks separately)
+    assert bytes(sctp)[SCTP.__hdr_len__:] == d[SCTP.__hdr_len__:]
+    sctp.sum = 0
+    packed = bytearray(bytes(sctp))
+    packed[8:12] = d[8:12]
+    assert bytes(packed) == d
