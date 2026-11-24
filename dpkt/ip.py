@@ -76,6 +76,7 @@ class IP(dpkt.Packet):
     opts = b''
 
     def __init__(self, *args, **kwargs):
+        self._truncated = False
         super(IP, self).__init__(*args, **kwargs)
 
         # If IP packet is not initialized by string and the len field has
@@ -86,8 +87,32 @@ class IP(dpkt.Packet):
     def __len__(self):
         return self.__hdr_len__ + len(self.opts) + len(self.data)
 
+    @property
+    def truncated(self):
+        """True when the captured packet is shorter than its total length field."""
+        return self._truncated
+
+    @truncated.setter
+    def truncated(self, value):
+        self._truncated = bool(value)
+
+    @property
+    def is_truncated(self):
+        return self.truncated
+
     def __bytes__(self):
         if self.sum == 0:
+            transport_truncated = (
+                self.p in (6, 17) and
+                isinstance(self.data, dpkt.Packet) and
+                getattr(self.data, 'truncated', False))
+            if self.truncated or transport_truncated:
+                # The payload is incomplete, so a checksum recomputed here
+                # would describe bytes the network stack never saw.  Preserve
+                # the original length and checksum instead of publishing a
+                # clean-looking result for a truncated packet.
+                return self.pack_hdr() + bytes(self.opts) + bytes(self.data)
+
             self.len = self.__len__()
             self.sum = dpkt.in_cksum(self.pack_hdr() + bytes(self.opts))
             if (self.p == 6 or self.p == 17) and (self._flags_offset & (IP_MF | IP_OFFMASK)) == 0 and \
@@ -111,11 +136,13 @@ class IP(dpkt.Packet):
         return self.pack_hdr() + bytes(self.opts) + bytes(self.data)
 
     def unpack(self, buf):
+        captured_len = len(buf)
         dpkt.Packet.unpack(self, buf)
         ol = ((self._v_hl & 0xf) << 2) - self.__hdr_len__
         if ol < 0:
             raise dpkt.UnpackError('invalid header length')
         self.opts = buf[self.__hdr_len__:self.__hdr_len__ + ol]
+        self._truncated = bool(self.len and captured_len < self.len)
         if self.len:
             buf = buf[self.__hdr_len__ + ol:self.len]
         else:  # very likely due to TCP segmentation offload
@@ -123,8 +150,45 @@ class IP(dpkt.Packet):
         try:
             self.data = self._protosw[self.p](buf) if self.offset == 0 else buf
             setattr(self, self.data.__class__.__name__.lower(), self.data)
+            if isinstance(self.data, dpkt.Packet):
+                if self.truncated:
+                    self.data.truncated = True
+                if hasattr(self.data, 'verify_checksum'):
+                    self.data._ip_src = self.src
+                    self.data._ip_dst = self.dst
+                    self.data._ip_version = 4
         except (KeyError, dpkt.UnpackError):
             self.data = buf
+
+    def verify_checksum(self):
+        """Verify the IPv4 header checksum.
+
+        Returns None for truncated packets, where the original packet identity
+        is incomplete and a header-only result could be mistaken for proof that
+        the whole packet is clean.
+        """
+        if self.truncated:
+            return None
+        if self.sum == 0:
+            # Zero is dpkt's "not populated yet" sentinel.  It is not evidence
+            # that a wire checksum was verified.
+            return None
+        return dpkt.in_cksum(self.pack_hdr() + bytes(self.opts)) == 0
+
+    @property
+    def checksum_valid(self):
+        return self.verify_checksum()
+
+    def verify_transport_checksum(self):
+        """Verify the transport checksum when the complete pseudoheader is known."""
+        if self.p not in (6, 17) or self.offset != 0:
+            return None
+        if not isinstance(self.data, dpkt.Packet):
+            return None
+        verify = getattr(self.data, 'verify_checksum', None)
+        if verify is None:
+            return None
+        return verify(self.src, self.dst)
 
     @classmethod
     def set_proto(cls, p, pktclass):
@@ -502,3 +566,46 @@ def test_default_udp_checksum():
 def test_get_proto_name():
     assert get_ip_proto_name(6) == 'TCP'
     assert get_ip_proto_name(999) is None
+
+
+def test_truncated_checksum_conclusions():
+    from . import tcp as tcp_mod
+    from . import udp as udp_mod
+
+    udp = udp_mod.UDP(sport=111, dport=222, ulen=14, data=b'foobar')
+    ip = IP(src=b'\x01\x02\x03\x04', dst=b'\x05\x06\x07\x08', p=17, data=udp)
+    raw = bytes(ip)
+
+    full = IP(raw)
+    assert not full.truncated
+    assert full.verify_checksum() is True
+    assert full.verify_transport_checksum() is True
+    assert full.data.checksum_valid is True
+
+    truncated = IP(raw[:-2])
+    assert truncated.truncated
+    assert truncated.is_truncated
+    assert truncated.data.truncated
+    assert truncated.verify_checksum() is None
+    assert truncated.verify_transport_checksum() is None
+    assert truncated.data.checksum_valid is None
+
+    # Forcing a recomputation on a truncated packet must not replace the
+    # original length or transport checksum with values derived from the
+    # incomplete capture.
+    wire_len = truncated.len
+    transport_sum = truncated.data.sum
+    truncated.sum = 0
+    bytes(truncated)
+    assert truncated.len == wire_len
+    assert truncated.data.sum == transport_sum
+
+    tcp = tcp_mod.TCP(sport=1, dport=2, data=b'hello')
+    ip = IP(src=b'\x01\x02\x03\x04', dst=b'\x05\x06\x07\x08', p=6, data=tcp)
+    raw = bytes(ip)
+    assert ip.verify_transport_checksum() is True
+    truncated = IP(raw[:-2])
+    assert truncated.truncated
+    assert truncated.data.truncated
+    assert truncated.verify_checksum() is None
+    assert truncated.verify_transport_checksum() is None

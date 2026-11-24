@@ -87,6 +87,26 @@ class TCP(dpkt.Packet):
     }
     opts = b''
 
+    def __init__(self, *args, **kwargs):
+        self._truncated = False
+        self._ip_src = None
+        self._ip_dst = None
+        self._ip_version = None
+        super(TCP, self).__init__(*args, **kwargs)
+
+    @property
+    def truncated(self):
+        """True when the enclosing packet declared more payload than was captured."""
+        return self._truncated
+
+    @truncated.setter
+    def truncated(self, value):
+        self._truncated = bool(value)
+
+    @property
+    def is_truncated(self):
+        return self.truncated
+
     def __len__(self):
         return self.__hdr_len__ + len(self.opts) + len(self.data)
 
@@ -94,12 +114,44 @@ class TCP(dpkt.Packet):
         return self.pack_hdr() + bytes(self.opts) + bytes(self.data)
 
     def unpack(self, buf):
+        self._truncated = False
+        self._ip_src = None
+        self._ip_dst = None
+        self._ip_version = None
         dpkt.Packet.unpack(self, buf)
         ol = ((self._off_flags >> 12) << 2) - self.__hdr_len__
         if ol < 0:
             raise dpkt.UnpackError('invalid header length')
         self.opts = buf[self.__hdr_len__:self.__hdr_len__ + ol]
         self.data = buf[self.__hdr_len__ + ol:]
+
+    def verify_checksum(self, src=None, dst=None):
+        """Verify the TCP checksum when the IP pseudoheader is available.
+
+        Returns None when the packet was truncated or the source/destination
+        addresses are unknown; in those cases no reliable verification result
+        can be produced.
+        """
+        if self.truncated:
+            return None
+
+        if src is None:
+            src = self._ip_src
+        if dst is None:
+            dst = self._ip_dst
+        if src is None or dst is None:
+            return None
+
+        p = bytes(self)
+        pseudo = dpkt.struct.pack(
+            '>4s4sxBH', src, dst, 6, len(p))
+        s = dpkt.in_cksum_add(0, pseudo)
+        s = dpkt.in_cksum_add(s, p)
+        return dpkt.in_cksum_done(s) == 0
+
+    @property
+    def checksum_valid(self):
+        return self.verify_checksum()
 
 
 # Options (opt_type) - http://www.iana.org/assignments/tcp-parameters
