@@ -60,42 +60,86 @@ class IP6(dpkt.Packet):
     }
     _protosw = ip.IP._protosw
 
+    def __init__(self, *args, **kwargs):
+        # Give every packet its own containers even when constructed without a
+        # byte buffer.  This avoids mutable class-level defaults and stale state
+        # when an unpack fails.
+        self.extension_hdrs = {}
+        self.all_extension_headers = []
+        dpkt.Packet.__init__(self, *args, **kwargs)
+
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
-        self.extension_hdrs = {}
 
-        # NOTE: self.extension_hdrs is not accurate, as it doesn't support duplicate header types.
-        # According to RFC-1883 "Each extension header should occur at most once, except for the
-        # Destination Options header which should occur at most twice".
-        # Secondly, the .headers_str() method attempts to pack the extension headers in order as
-        # defined in the RFC, however it doesn't adjust the next header (nxt) pointer accordingly.
-        # Here we introduce the new field .all_extension_headers; it allows duplicate types and
-        # keeps the original order.
+        # Reset public state before parsing untrusted input.
+        self.extension_hdrs = {}
         self.all_extension_headers = []
 
         if self.plen:
-            buf = self.data[:self.plen]
+            payload = self.data[:self.plen]
         else:  # due to jumbo payload or TSO
-            buf = self.data
+            payload = self.data
+
+        # Start from a bounded raw payload.  Successful protocol decoding
+        # replaces this with the upper-layer packet.
+        self.data = payload
+        self.p = self.nxt
 
         next_ext_hdr = self.nxt
+        buf = payload
+        # The dict is the legacy keyed view; duplicate protocol numbers are
+        # overwritten there.  The list retains every confirmed header/order.
+        extension_hdrs = {}
+        all_extension_headers = []
 
         while next_ext_hdr in EXT_HDRS:
+            # A Hop-by-Hop header is only valid immediately after the IPv6
+            # header and may only occur once.
+            if next_ext_hdr == ip.IP_PROTO_HOPOPTS and all_extension_headers:
+                raise dpkt.UnpackError(
+                    'duplicate or misplaced IPv6 Hop-by-Hop extension header')
+
+            if not buf:
+                raise dpkt.NeedData('truncated IPv6 extension header chain')
+
             ext = EXT_HDRS_CLS[next_ext_hdr](buf)
-            self.extension_hdrs[next_ext_hdr] = ext
-            self.all_extension_headers.append(ext)
-            buf = buf[ext.length:]
+            length = getattr(ext, 'length', None)
+
+            try:
+                length = int(length)
+            except (TypeError, ValueError):
+                length = 0
+            hdr_len = getattr(ext, '__hdr_len__', 0)
+            if length <= 0 or length < hdr_len:
+                raise dpkt.UnpackError(
+                    'invalid or truncated IPv6 extension header length')
+            if length > len(buf):
+                raise dpkt.NeedData('truncated IPv6 extension header')
+            if len(ext) != length:
+                raise dpkt.UnpackError(
+                    'inconsistent IPv6 extension header boundary')
+
+            extension_hdrs[next_ext_hdr] = ext
+            all_extension_headers.append(ext)
+
+            # Offset > 0 marks a non-first fragment.  Remaining bytes are
+            # continuation payload and must not be parsed as extensions/L4.
+            if next_ext_hdr == ip.IP_PROTO_FRAGMENT and ext.frag_off > 0:
+                self.extension_hdrs = extension_hdrs
+                self.all_extension_headers = all_extension_headers
+                self.p = getattr(ext, 'nxt', next_ext_hdr)
+                self.data = buf[length:]
+                return
+
+            buf = buf[length:]
             next_ext_hdr = getattr(ext, 'nxt', None)
+
+        self.extension_hdrs = extension_hdrs
+        self.all_extension_headers = all_extension_headers
 
         # set the payload protocol id
         if next_ext_hdr is not None:
             self.p = next_ext_hdr
-
-        # do not decode fragments after the first fragment
-        # https://github.com/kbandla/dpkt/issues/575
-        if self.nxt == 44 and ext.frag_off > 0:  # 44 = IP_PROTO_FRAGMENT
-            self.data = buf
-            return
 
         try:
             self.data = self._protosw[next_ext_hdr](buf)
@@ -108,7 +152,7 @@ class IP6(dpkt.Packet):
         # If all_extension_headers is available, return the headers as they originally appeared
         if hasattr(self, 'all_extension_headers') and self.all_extension_headers:
             # get the nxt header from the last one
-            nxt = self.all_extension_headers[-1].nxt
+            nxt = getattr(self.all_extension_headers[-1], 'nxt', ip.IP_PROTO_NONE)
             return nxt, b''.join(bytes(ext) for ext in self.all_extension_headers)
 
         # Output extension headers in order defined in RFC1883 (except dest opts)
@@ -116,7 +160,8 @@ class IP6(dpkt.Packet):
         if hasattr(self, 'extension_hdrs'):
             for hdr in EXT_HDRS:
                 if hdr in self.extension_hdrs:
-                    nxt = self.extension_hdrs[hdr].nxt
+                    ext = self.extension_hdrs[hdr]
+                    nxt = getattr(ext, 'nxt', ip.IP_PROTO_NONE)
                     header_str += bytes(self.extension_hdrs[hdr])
         return nxt, header_str
 
@@ -278,7 +323,12 @@ class IP6AHHeader(IP6ExtensionHeader):
     def unpack(self, buf):
         dpkt.Packet.unpack(self, buf)
         self.length = (self.len + 2) * 4
-        self.auth_data = self.data[:(self.len - 1) * 4]
+        auth_data_len = max(0, (self.len - 1) * 4)
+        self.auth_data = self.data[:auth_data_len]
+        # Bound the serialized header to its declared length.  Otherwise a
+        # chained header/payload following AH would be retained in ext.data
+        # and serialized twice.
+        self.data = self.auth_data
 
 
 class IP6ESPHeader(IP6ExtensionHeader):
