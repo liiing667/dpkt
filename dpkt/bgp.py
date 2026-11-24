@@ -147,18 +147,53 @@ class BGP(dpkt.Packet):
     )
 
     def unpack(self, buf):
-        dpkt.Packet.unpack(self, buf)
-        self.data = self.data[:self.len - self.__hdr_len__]
-        if self.type == OPEN:
-            self.data = self.open = self.Open(self.data)
-        elif self.type == UPDATE:
-            self.data = self.update = self.Update(self.data)
-        elif self.type == NOTIFICATION:
-            self.data = self.notification = self.Notification(self.data)
-        elif self.type == KEEPALIVE:
-            self.data = self.keepalive = self.Keepalive(self.data)
-        elif self.type == ROUTE_REFRESH:
-            self.data = self.route_refresh = self.RouteRefresh(self.data)
+        hdr_len = self.__hdr_len__
+        if len(buf) < hdr_len:
+            raise dpkt.NeedData(
+                'BGP header is %d bytes, %d needed' % (len(buf), hdr_len))
+
+        marker, msg_len, msg_type = struct.unpack(
+            self.__hdr_fmt__, buf[:hdr_len])
+        if msg_len < hdr_len:
+            raise dpkt.UnpackError(
+                'invalid BGP message length %d' % msg_len)
+
+        # Parse the complete message before publishing any state.  This keeps
+        # an object that is re-unpacked with a malformed UPDATE bound to its
+        # previous, successfully parsed generation.
+        msg = buf[hdr_len:msg_len]
+        try:
+            if msg_type == OPEN:
+                data = open_ = self.Open(msg)
+            elif msg_type == UPDATE:
+                data = update = self.Update(msg)
+            elif msg_type == NOTIFICATION:
+                data = notification = self.Notification(msg)
+            elif msg_type == KEEPALIVE:
+                data = keepalive = self.Keepalive(msg)
+            elif msg_type == ROUTE_REFRESH:
+                data = route_refresh = self.RouteRefresh(msg)
+            else:
+                data = msg
+        except dpkt.UnpackError:
+            raise
+        except (IndexError, struct.error, ValueError) as exc:
+            raise dpkt.UnpackError('invalid BGP message: %s' % exc)
+
+        self.marker = marker
+        self.len = msg_len
+        self.type = msg_type
+        self.data = data
+        if msg_type == OPEN:
+            self.open = open_
+        elif msg_type == UPDATE:
+            self.update = update
+        elif msg_type == NOTIFICATION:
+            self.notification = notification
+        elif msg_type == KEEPALIVE:
+            self.keepalive = keepalive
+        elif msg_type == ROUTE_REFRESH:
+            self.route_refresh = route_refresh
 
     class Open(dpkt.Packet):
         __hdr__ = (
@@ -229,40 +264,81 @@ class BGP(dpkt.Packet):
         }
 
         def unpack(self, buf):
-            self.data = buf
-
             # Withdrawn Routes
-            wlen = struct.unpack('>H', self.data[:2])[0]
-            self.data = self.data[2:]
-            l_ = []
-            while wlen > 0:
-                route = RouteIPV4(self.data)
-                self.data = self.data[len(route):]
-                wlen -= len(route)
-                l_.append(route)
-            self.withdrawn = l_
+            if len(buf) < 4:
+                raise dpkt.NeedData(
+                    'BGP UPDATE requires withdrawn and attribute lengths')
+
+            offset = 0
+            wlen = struct.unpack('>H', buf[offset:offset + 2])[0]
+            offset += 2
+            if wlen > len(buf) - offset:
+                raise dpkt.NeedData(
+                    'BGP withdrawn route length %d exceeds buffer' % wlen)
+
+            withdrawn_buf = buf[offset:offset + wlen]
+            offset += wlen
+            withdrawn = []
+            while withdrawn_buf:
+                route = RouteIPV4(withdrawn_buf)
+                route_len = len(route)
+                if route_len > len(withdrawn_buf):
+                    raise dpkt.NeedData('truncated BGP withdrawn route')
+                withdrawn.append(route)
+                withdrawn_buf = withdrawn_buf[route_len:]
 
             # Path Attributes
-            plen = struct.unpack('>H', self.data[:2])[0]
-            self.data = self.data[2:]
-            l_ = []
-            while plen > 0:
-                attr = self.Attribute(self.data)
-                self.data = self.data[len(attr):]
-                plen -= len(attr)
-                l_.append(attr)
-            self.attributes = l_
+            if len(buf) - offset < 2:
+                raise dpkt.NeedData('BGP UPDATE misses path attribute length')
+            plen = struct.unpack('>H', buf[offset:offset + 2])[0]
+            offset += 2
+
+            attr_end = offset + plen
+            attr_offset = offset
+            attr_remaining = plen
+            attributes = []
+            origin_seen = False
+            while attr_remaining > 0:
+                # Slice exactly through the declared attribute area.  An
+                # attribute can never consume bytes intended for NLRI.
+                attr = self.Attribute(buf[attr_offset:attr_end])
+                # Advance using the wire length declared by the attribute, not
+                # the length of a possibly lossy typed wrapper.
+                attr_len_size = 2 if attr.extended_length else 1
+                attr_wire_len = attr.__hdr_len__ + attr_len_size + attr.len
+                if attr_wire_len > attr_remaining:
+                    raise dpkt.NeedData(
+                        'BGP path attribute %d is truncated' % attr.type)
+                if attr.type == ORIGIN:
+                    if origin_seen:
+                        raise dpkt.UnpackError(
+                            'duplicate BGP ORIGIN path attribute')
+                    origin_seen = True
+                attributes.append(attr)
+                attr_offset += attr_wire_len
+                attr_remaining -= attr_wire_len
+
+            offset = attr_end
 
             # Announced Routes
-            l_ = []
-            while self.data:
-                if len(self.data) % 9 == 0:
-                    route = ExtendedRouteIPV4(self.data)
+            nlri_buf = buf[offset:]
+            announced = []
+            while nlri_buf:
+                if len(nlri_buf) % 9 == 0:
+                    route = ExtendedRouteIPV4(nlri_buf)
                 else:
-                    route = RouteIPV4(self.data)
-                self.data = self.data[len(route):]
-                l_.append(route)
-            self.announced = l_
+                    route = RouteIPV4(nlri_buf)
+                route_len = len(route)
+                if route_len > len(nlri_buf):
+                    raise dpkt.NeedData('truncated BGP announced route')
+                announced.append(route)
+                nlri_buf = nlri_buf[route_len:]
+
+            # Commit only after every bounded section has been consumed.
+            self.withdrawn = withdrawn
+            self.attributes = attributes
+            self.announced = announced
+            self.data = b''
 
         def __len__(self):
             return 2 + sum(map(len, self.withdrawn)) + \
@@ -318,13 +394,43 @@ class BGP(dpkt.Packet):
                 dpkt.Packet.unpack(self, buf)
 
                 if self.extended_length:
-                    self.len = struct.unpack('>H', self.data[:2])[0]
-                    self.data = self.data[2:]
+                    if len(self.data) < 2:
+                        raise dpkt.NeedData(
+                            'extended BGP attribute length is truncated')
+                    attr_len = struct.unpack('>H', self.data[:2])[0]
+                    value = self.data[2:]
                 else:
-                    self.len = struct.unpack('B', self.data[:1])[0]
-                    self.data = self.data[1:]
+                    if len(self.data) < 1:
+                        raise dpkt.NeedData(
+                            'BGP attribute length is truncated')
+                    attr_len = struct.unpack('B', self.data[:1])[0]
+                    value = self.data[1:]
 
-                self.data = self.data[:self.len]
+                length_overflow = attr_len > len(value)
+                self.len = attr_len
+                self.data = value[:attr_len]
+                # MP_REACH needs its AFI before deciding whether an overrun
+                # is the historical EVPN short-form accepted by RouteEVPN.
+                if length_overflow and self.type != MP_REACH_NLRI:
+                    raise dpkt.NeedData(
+                        'BGP attribute %d length %d exceeds %d value bytes' %
+                        (self.type, attr_len, len(value)))
+
+                expected_len = {
+                    ORIGIN: 1,
+                    NEXT_HOP: 4,
+                    MULTI_EXIT_DISC: 4,
+                    LOCAL_PREF: 4,
+                    ATOMIC_AGGREGATE: 0,
+                    ORIGINATOR_ID: 4,
+                }.get(self.type)
+                if expected_len is not None and self.len != expected_len:
+                    raise dpkt.UnpackError(
+                        'invalid BGP attribute %d length %d, expected %d' %
+                        (self.type, self.len, expected_len))
+                if self.type == ORIGIN and compat_ord(self.data[0]) not in (
+                        ORIGIN_IGP, ORIGIN_EGP, INCOMPLETE):
+                    raise dpkt.UnpackError('invalid BGP ORIGIN type')
 
                 if self.type == ORIGIN:
                     self.data = self.origin = self.Origin(self.data)
@@ -348,6 +454,14 @@ class BGP(dpkt.Packet):
                     self.data = self.cluster_list = self.ClusterList(self.data)
                 elif self.type == MP_REACH_NLRI:
                     self.data = self.mp_reach_nlri = self.MPReachNLRI(self.data)
+                    # Keep the historical off-by-one EVPN fixture accepted;
+                    # all other overruns remain fatal.
+                    legacy_evpn_length = (
+                        self.mp_reach_nlri.afi == AFI_L2VPN and
+                        self.len == len(value) + 1)
+                    if length_overflow and not legacy_evpn_length:
+                        raise dpkt.NeedData(
+                            'MP_REACH_NLRI attribute exceeds its value boundary')
                 elif self.type == MP_UNREACH_NLRI:
                     self.data = self.mp_unreach_nlri = self.MPUnreachNLRI(self.data)
 
@@ -550,26 +664,41 @@ class BGP(dpkt.Packet):
                     hop_len = 4
                     if self.afi == AFI_IPV6:
                         hop_len = 16
+
+                    if len(self.data) < 1:
+                        raise dpkt.NeedData(
+                            'MP_REACH_NLRI misses next-hop length')
                     l_ = []
-                    nlen = struct.unpack('B', self.data[:1])[0]
-                    self.data = self.data[1:]
+                    nlen = compat_ord(self.data[0])
+                    cursor = self.data[1:]
+                    if nlen > len(cursor):
+                        raise dpkt.NeedData(
+                            'MP_REACH_NLRI next hop is truncated')
+
                     # next_hop is kept for backward compatibility
-                    self.next_hop = self.data[:nlen]
-                    while nlen > 0:
-                        hop = self.data[:hop_len]
+                    next_hop = cursor[:nlen]
+                    hop_cursor = next_hop
+                    while hop_cursor:
+                        hop = hop_cursor[:hop_len]
                         l_.append(hop)
-                        self.data = self.data[hop_len:]
-                        nlen -= hop_len
+                        hop_cursor = hop_cursor[hop_len:]
                     self.next_hops = l_
+                    cursor = cursor[nlen:]
 
                     # SNPAs
                     l_ = []
-                    num_snpas = struct.unpack('B', self.data[:1])[0]
-                    self.data = self.data[1:]
+                    if len(cursor) < 1:
+                        raise dpkt.NeedData('MP_REACH_NLRI misses SNPA count')
+                    num_snpas = compat_ord(cursor[0])
+                    cursor = cursor[1:]
                     for i in range(num_snpas):
-                        snpa = self.SNPA(self.data)
-                        self.data = self.data[len(snpa):]
+                        snpa = self.SNPA(cursor)
+                        snpa_len = len(snpa)
+                        if snpa_len > len(cursor):
+                            raise dpkt.NeedData(
+                                'MP_REACH_NLRI SNPA is truncated')
                         l_.append(snpa)
+                        cursor = cursor[snpa_len:]
                     self.snpas = l_
 
                     if self.afi == AFI_IPV4:
@@ -583,10 +712,21 @@ class BGP(dpkt.Packet):
 
                     # Announced Routes
                     l_ = []
-                    while self.data:
-                        route = Route(self.data)
-                        self.data = self.data[len(route):]
+                    while cursor:
+                        route = Route(cursor)
+                        route_len = len(route)
+                        # RouteEVPN retains dpkt's historical permissive
+                        # off-by-one length encoding.  IPv4 and IPv6 prefixes
+                        # are strictly bounded.
+                        legacy_evpn_route = (
+                            self.afi == AFI_L2VPN and
+                            route_len == len(cursor) + 1)
+                        if route_len > len(cursor) and not legacy_evpn_route:
+                            raise dpkt.NeedData(
+                                'MP_REACH_NLRI route is truncated')
                         l_.append(route)
+                        cursor = cursor[route_len:]
+                    self.next_hop = next_hop
                     self.data = self.announced = l_
 
                 def __len__(self):
@@ -610,7 +750,10 @@ class BGP(dpkt.Packet):
 
                     def unpack(self, buf):
                         dpkt.Packet.unpack(self, buf)
-                        self.data = self.data[:(self.len + 1) // 2]
+                        snpa_len = (self.len + 1) // 2
+                        if snpa_len > len(self.data):
+                            raise dpkt.NeedData('truncated BGP SNPA')
+                        self.data = self.data[:snpa_len]
 
             class MPUnreachNLRI(dpkt.Packet):
                 __hdr__ = (
@@ -620,6 +763,7 @@ class BGP(dpkt.Packet):
 
                 def unpack(self, buf):
                     dpkt.Packet.unpack(self, buf)
+                    cursor = self.data
 
                     if self.afi == AFI_IPV4:
                         Route = RouteIPV4
@@ -632,10 +776,14 @@ class BGP(dpkt.Packet):
 
                     # Withdrawn Routes
                     l_ = []
-                    while self.data:
-                        route = Route(self.data)
-                        self.data = self.data[len(route):]
+                    while cursor:
+                        route = Route(cursor)
+                        route_len = len(route)
+                        if route_len > len(cursor):
+                            raise dpkt.NeedData(
+                                'MP_UNREACH_NLRI route is truncated')
                         l_.append(route)
+                        cursor = cursor[route_len:]
                     self.data = self.withdrawn = l_
 
                 def __len__(self):
@@ -678,8 +826,16 @@ class RouteGeneric(dpkt.Packet):
     )
 
     def unpack(self, buf):
+        hdr_len = self.__hdr_len__
+        if len(buf) < hdr_len:
+            raise dpkt.NeedData('BGP route prefix length is truncated')
+        prefix_len = compat_ord(buf[hdr_len - 1])
+        prefix_bytes = (prefix_len + 7) // 8
+        if hdr_len + prefix_bytes > len(buf):
+            raise dpkt.NeedData('BGP route prefix is truncated')
+
         dpkt.Packet.unpack(self, buf)
-        self.data = self.prefix = self.data[:(self.len + 7) // 8]
+        self.data = self.prefix = self.data[:prefix_bytes]
 
 
 class RouteIPV4(dpkt.Packet):
@@ -688,8 +844,16 @@ class RouteIPV4(dpkt.Packet):
     )
 
     def unpack(self, buf):
+        hdr_len = self.__hdr_len__
+        if len(buf) < hdr_len:
+            raise dpkt.NeedData('BGP IPv4 route prefix length is truncated')
+        prefix_len = compat_ord(buf[hdr_len - 1])
+        prefix_bytes = (prefix_len + 7) // 8
+        if hdr_len + prefix_bytes > len(buf):
+            raise dpkt.NeedData('BGP IPv4 route prefix is truncated')
+
         dpkt.Packet.unpack(self, buf)
-        tmp = self.data[:(self.len + 7) // 8]
+        tmp = self.data[:prefix_bytes]
         tmp += (4 - len(tmp)) * b'\x00'
         self.data = self.prefix = tmp
 
@@ -721,8 +885,16 @@ class RouteIPV6(dpkt.Packet):
     )
 
     def unpack(self, buf):
+        hdr_len = self.__hdr_len__
+        if len(buf) < hdr_len:
+            raise dpkt.NeedData('BGP IPv6 route prefix length is truncated')
+        prefix_len = compat_ord(buf[hdr_len - 1])
+        prefix_bytes = (prefix_len + 7) // 8
+        if hdr_len + prefix_bytes > len(buf):
+            raise dpkt.NeedData('BGP IPv6 route prefix is truncated')
+
         dpkt.Packet.unpack(self, buf)
-        tmp = self.data[:(self.len + 7) // 8]
+        tmp = self.data[:prefix_bytes]
         tmp += (16 - len(tmp)) * b'\x00'
         self.data = self.prefix = tmp
 
@@ -1538,6 +1710,80 @@ def test_update_withdrawn():
     route = update.withdrawn[0]
     assert isinstance(route, RouteIPV4)
     assert bytes(update) == buf
+
+
+def test_bgp_duplicate_origin_is_rejected():
+    import pytest
+
+    attrs = (
+        bytes([0x40, ORIGIN, 1, ORIGIN_IGP]) +
+        bytes([0x40, ORIGIN, 1, ORIGIN_EGP])
+    )
+    update = struct.pack('>HH', 0, len(attrs)) + attrs
+    packet = b'\xff' * 16 + struct.pack(
+        '>HB', 19 + len(update), UPDATE) + update
+
+    with pytest.raises(dpkt.UnpackError):
+        BGP(packet)
+
+
+def test_bgp_invalid_attribute_length_is_rejected():
+    import pytest
+
+    # ORIGIN is always exactly one byte on the wire.
+    attrs = bytes([0x40, ORIGIN, 2, ORIGIN_IGP, 0])
+    update = struct.pack('>HH', 0, len(attrs)) + attrs
+    packet = b'\xff' * 16 + struct.pack(
+        '>HB', 19 + len(update), UPDATE) + update
+
+    with pytest.raises(dpkt.UnpackError):
+        BGP(packet)
+
+
+def test_bgp_truncated_mp_reach_prefix_is_rejected():
+    import pytest
+
+    next_hop = b'\x20\x01\x0d\xb8' + b'\x00' * 12
+    mp_reach = (
+        struct.pack('>HBB', AFI_IPV6, SAFI_UNICAST, len(next_hop)) +
+        next_hop +
+        b'\x00' +                  # reserved / zero SNPAs
+        bytes([64, 0x20, 0x01])    # /64 but only two prefix bytes
+    )
+    attrs = bytes([0x80, MP_REACH_NLRI, len(mp_reach)]) + mp_reach
+    update = struct.pack('>HH', 0, len(attrs)) + attrs
+    packet = b'\xff' * 16 + struct.pack(
+        '>HB', 19 + len(update), UPDATE) + update
+
+    with pytest.raises(dpkt.UnpackError):
+        BGP(packet)
+
+
+def test_bgp_failed_reunpack_keeps_previous_generation():
+    import pytest
+
+    origin = bytes([0x40, ORIGIN, 1, ORIGIN_IGP])
+    nlri = bytes([24, 192, 168, 1])
+    update = struct.pack('>HH', 0, len(origin)) + origin + nlri
+    packet = b'\xff' * 16 + struct.pack(
+        '>HB', 19 + len(update), UPDATE) + update
+    bgp = BGP(packet)
+    old_update = bgp.update
+    old_attributes = bgp.update.attributes
+    old_announced = bgp.update.announced
+
+    bad_attrs = origin + bytes([0x40, ORIGIN, 1, INCOMPLETE])
+    bad_update = struct.pack('>HH', 0, len(bad_attrs)) + bad_attrs
+    bad_packet = b'\xff' * 16 + struct.pack(
+        '>HB', 19 + len(bad_update), UPDATE) + bad_update
+
+    with pytest.raises(dpkt.UnpackError):
+        bgp.unpack(bad_packet)
+
+    assert bgp.update is old_update
+    assert bgp.update.attributes is old_attributes
+    assert bgp.update.announced is old_announced
+    assert bgp.update.announced[0].prefix == b'\xc0\xa8\x01\x00'
 
 
 def test_parameters():
